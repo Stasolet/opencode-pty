@@ -30,7 +30,8 @@
 // =============================================================================
 
 import { appendFileSync, mkdirSync } from 'node:fs'
-import type { TuiPluginApi, TuiPluginModule } from '@opencode-ai/plugin/tui'
+import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
+import type { Plugin } from '@opencode/plugin/tui'
 import {
   createElement,
   createTextNode,
@@ -736,7 +737,7 @@ const tui = async (api: TuiPluginApi): Promise<void> => {
 
   /**
    * Removing a RUNNING session kills a live process, so it is confirmed first; a
-   * finished one is only a record, so its ✕ acts at once. DialogConfirm clears
+   * finished one is only a record, so its ✕ acts at once. confirm() closes
    * itself after a choice, so neither branch touches the dialog stack.
    */
   const confirmRemove = (session: PtySession): void => {
@@ -750,15 +751,17 @@ const tui = async (api: TuiPluginApi): Promise<void> => {
       removeSession(session).catch(() => {})
       return
     }
-    api.ui.dialog.replace(() =>
-      api.ui.DialogConfirm({
-        title: 'Remove PTY session',
-        message:
-          'Kill the running session \u201c' +
-          (session.title || session.id) +
-          '\u201d and remove it?',
-        onConfirm: () => removeSession(session).catch(() => {}),
-      })
+    // The native host removed the DialogConfirm component; the setup() bridge
+    // exposes confirm() with the same semantics (auto-closes, choice acts or
+    // dismisses). Cast mirrors how the client and renderer are narrowed above.
+    ;(
+      api.ui.dialog as unknown as {
+        confirm(title: string, message: string, onConfirm: () => void): void
+      }
+    ).confirm(
+      'Remove PTY session',
+      'Kill the running session \u201c' + (session.title || session.id) + '\u201d and remove it?',
+      () => removeSession(session).catch(() => {})
     )
   }
 
@@ -937,4 +940,192 @@ const tui = async (api: TuiPluginApi): Promise<void> => {
   }, POLL_MS)
 }
 
-export default { id: 'opencode-pty', tui } satisfies TuiPluginModule
+// ── native host bridge ───────────────────────────────────────────────────────
+
+/**
+ * opencode 2.x loads terminal plugins as `{ id, setup(context) }` modules
+ * (`@opencode/plugin/tui`) and rejects the older `{ id, tui(api) }` shape with
+ * "Invalid V2 TUI plugin module". Everything above is written against the old
+ * api surface, so `setup` bridges the native context into it — each mapping is
+ * one deliberate line, and behaviour deltas are noted where they exist.
+ */
+const setup = async (context: Plugin.Context): Promise<() => void> => {
+  debug('setup.enter', { version: context.app.version })
+  const disposers: Array<() => void> = []
+
+  // Persisted user preferences (collapse state). The native store is durable
+  // and live-synced across running TUI instances — the same kv semantics the
+  // comment on KV_COLLAPSED relies on.
+  const [kvStore, kvWrite] = context.storage.store<Record<string, unknown>>('kv', {
+    initial: {},
+  })
+
+  // Native dialogs expose no readable size; the open code reads it for a debug
+  // line only, so track what setSize asked for.
+  let dialogSize = 'medium'
+
+  /** Theme colors flattened onto the legacy palette names the render code reads. */
+  const palette = () => {
+    const t = context.theme as unknown as {
+      border?: { base?: unknown }
+      background?: { raised?: { base?: unknown } }
+      text?: { base?: unknown; muted?: unknown; feedback?: Record<string, { base?: unknown }> }
+    }
+    return {
+      border: t.border?.base,
+      backgroundElement: t.background?.raised?.base,
+      text: t.text?.base,
+      textMuted: t.text?.muted,
+      success: t.text?.feedback?.success?.base,
+      error: t.text?.feedback?.error?.base,
+    }
+  }
+
+  /**
+   * Text pieces of a native message in the legacy part shape ({ text } — the
+   * bootstrap scrape only ever reads part.text).
+   */
+  const partsOf = (message: unknown): Array<{ text?: string }> => {
+    const m = message as {
+      text?: unknown
+      content?: Array<{
+        type?: string
+        text?: unknown
+        state?: { content?: Array<{ type?: string; text?: unknown }> }
+      }>
+    }
+    const parts: Array<{ text?: string }> = []
+    if (typeof m.text === 'string') parts.push({ text: m.text })
+    for (const item of m.content ?? []) {
+      if ((item.type === 'text' || item.type === 'reasoning') && typeof item.text === 'string') {
+        parts.push({ text: item.text })
+        continue
+      }
+      if (item.type !== 'tool') continue
+      for (const chunk of item.state?.content ?? []) {
+        if (chunk.type === 'text' && typeof chunk.text === 'string') parts.push({ text: chunk.text })
+      }
+    }
+    return parts
+  }
+
+  const api = {
+    // Generated client: `create` takes the fields flat and resolves the entity
+    // directly (no {data} wrapper); commands are { name, text }; deleting is
+    // `remove`.
+    client: {
+      session: {
+        create: (input: { title: string }) => context.client.session.create({ title: input.title }),
+        command: (input: { sessionID: string; command: string; arguments?: string }) =>
+          context.client.session.command({
+            sessionID: input.sessionID,
+            name: input.command,
+            text: input.arguments ?? '',
+          }),
+        delete: (input: { sessionID: string }) =>
+          context.client.session.remove({ sessionID: input.sessionID }),
+      },
+    },
+    renderer: context.renderer,
+    state: {
+      // Native location carries the directory only. The worktree fallback in
+      // originsForProject then never fires; discovery self-heals through the
+      // bootstrap path (create scratch session → run command → scrape URL).
+      get path() {
+        return {
+          directory: context.location?.directory ?? '',
+          worktree: undefined as string | undefined,
+        }
+      },
+      session: {
+        messages: (sessionID: string) => {
+          // The data cache updates from events; kick a sync so the next poll
+          // pass of the bootstrap scrape sees fresh command output.
+          void context.data.session.message.sync(sessionID).catch(() => {})
+          return context.data.session.message
+            .list(sessionID)
+            .map((message: { id: string }) => ({ id: message.id, parts: partsOf(message) }))
+        },
+      },
+      // Obsolete with parts inline on every message; kept so the `?? ` fallback
+      // in messageTexts resolves to a (never-used) empty list instead of throwing.
+      part: () => [],
+    },
+    ui: {
+      toast: (options: { variant?: string; title?: string; message: string }) => {
+        context.ui.toast.show(options as Parameters<typeof context.ui.toast.show>[0])
+      },
+      dialog: {
+        replace: (render: () => JSX.Element, onClose?: () => void) => {
+          context.ui.dialog.show(render, onClose)
+        },
+        setSize: (size: 'medium' | 'large' | 'xlarge') => {
+          dialogSize = size
+          context.ui.dialog.set({ size })
+        },
+        get size() {
+          return dialogSize
+        },
+        // Added for the one patched call site (confirmRemove above): the native
+        // host has no DialogConfirm component, and dialog.confirm matches its
+        // semantics — auto-closes, resolves the choice.
+        confirm: (title: string, message: string, onConfirm: () => void) => {
+          void context.ui.dialog
+            .confirm({ title, message })
+            .then((confirmed) => {
+              if (confirmed) onConfirm()
+            })
+            .catch(() => {})
+        },
+      },
+    },
+    theme: {
+      get current() {
+        return palette()
+      },
+    },
+    // Legacy slot registration maps onto a single native append claim;
+    // SLOT_ORDER has no native equivalent (claims place against the
+    // built-in sidebar group).
+    slots: {
+      register: (definition: { slots: Record<string, () => JSX.Element> }) => {
+        const content = definition.slots.sidebar_content
+        if (typeof content === 'function') {
+          disposers.push(context.ui.slot({ append: 'sidebar.content', render: () => content() }))
+        }
+      },
+    },
+    kv: {
+      get: (key: string, fallback: unknown): unknown =>
+        (kvStore as Record<string, unknown>)[key] ?? fallback,
+      set: (key: string, value: unknown): void => {
+        void kvWrite((draft) => {
+          draft[key] = value
+        })
+      },
+    },
+    lifecycle: {
+      onDispose: (callback: () => void) => {
+        disposers.push(callback)
+      },
+    },
+  }
+
+  // Same contract as the legacy loader: this must not block startup, and tui()
+  // already returns before its first refresh resolves.
+  await tui(api as unknown as TuiPluginApi)
+
+  return () => {
+    for (const dispose of disposers) {
+      try {
+        dispose()
+      } catch (_) {
+        /* disposal is best-effort */
+      }
+    }
+  }
+}
+
+// Dual shape: 2.x hosts pick `setup`; `tui` stays for hosts that still use the
+// older module contract.
+export default { id: 'opencode-pty', setup, tui }

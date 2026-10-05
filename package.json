@@ -83,6 +83,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.3.13",
+    "@opencode/client": "^2.0.23",
+    "@opencode/theme": "^2.0.23",
     "@opentui/core": "0.4.5",
     "@opentui/keymap": "0.4.5",
     "@opentui/solid": "0.4.5",
@@ -123,7 +125,7 @@
   "dependencies": {
     "@opencode-ai/plugin": "^1.18",
     "@opencode-ai/sdk": "^1.18",
-    "@opencode/plugin": "^2.0.10",
+    "@opencode/plugin": "^2.0.23",
     "bun-pty": "^0.4.10",
     "open": "^11.0.0"
   }
